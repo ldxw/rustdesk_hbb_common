@@ -1,4 +1,4 @@
-name: Sync hbb_common with conditional overwrite
+name: Sync hbb_common with variable-specific replacement
 
 on:
   schedule:
@@ -23,57 +23,76 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Add upstream and fetch updates
+      - name: Add upstream and check for updates
         run: |
           git remote add upstream https://github.com/rustdesk/hbb_common.git || true
           git fetch upstream
+          
+          # 检查上游是否有任何更新
+          if git diff --quiet main upstream/main; then
+            echo "UPSTREAM_UPDATED=false" >> $GITHUB_ENV
+            echo "No updates from upstream"
+          else
+            echo "UPSTREAM_UPDATED=true" >> $GITHUB_ENV
+            echo "Found updates from upstream"
+            
+            # 保存上游和本地的目标变量值用于对比
+            # 获取上游的变量值
+            UPSTREAM_RENDEZVOUS=$(git show upstream/main:src/config.rs | grep -E 'RENDEZVOUS_SERVERS' | grep -oP '"[^"]+"')
+            UPSTREAM_RS_PUB_KEY=$(git show upstream/main:src/config.rs | grep -E 'RS_PUB_KEY' | grep -oP '"[^"]+"')
+            
+            # 获取本地的变量值
+            LOCAL_RENDEZVOUS=$(grep -E 'RENDEZVOUS_SERVERS' src/config.rs | grep -oP '"[^"]+"')
+            LOCAL_RS_PUB_KEY=$(grep -E 'RS_PUB_KEY' src/config.rs | grep -oP '"[^"]+"')
+            
+            # 对比变量值是否有变化
+            if [ "$UPSTREAM_RENDEZVOUS" != "$LOCAL_RENDEZVOUS" ] || [ "$UPSTREAM_RS_PUB_KEY" != "$LOCAL_RS_PUB_KEY" ]; then
+              echo "VARIABLES_UPDATED=true" >> $GITHUB_ENV
+              echo "Upstream modified RENDEZVOUS_SERVERS or RS_PUB_KEY"
+            else
+              echo "VARIABLES_UPDATED=false" >> $GITHUB_ENV
+              echo "Upstream did not modify target variables"
+            fi
+          fi
 
-      - name: Sync with upstream (preserve local unless conflict)
+      - name: Sync with upstream (if updated)
+        if: env.UPSTREAM_UPDATED == 'true'
         run: |
           git checkout main
           
-          # 尝试普通合并，优先保留本地修改
+          # 优先保留本地修改，冲突时使用上游版本
           if git merge upstream/main; then
-            echo "Merge successful - no conflicts, local changes preserved"
+            echo "Merge successful - no conflicts"
           else
-            echo "Conflicts detected - resolving with upstream version for conflicting files"
-            # 冲突时，仅对冲突文件使用上游版本覆盖
-            git merge --abort  # 放弃当前合并
-            git merge upstream/main -X theirs  # 冲突文件采用上游版本
+            echo "Resolving conflicts with upstream version"
+            git merge --abort
+            git merge upstream/main -X theirs
           fi
 
-      - name: Debug - Check config.rs existence
-        run: |
-          echo "Checking src/config.rs..."
-          if [ -f "src/config.rs" ]; then
-            echo "src/config.rs exists"
-          else
-            echo "Error: src/config.rs not found!"
-            exit 1
-          fi
-
-      - name: Replace domain and key from secrets
+      - name: Replace domain and key (only if variables updated)
+        if: env.VARIABLES_UPDATED == 'true'
         run: |
           NEW_DOMAIN="${{ secrets.RENDEZVOUS_DOMAIN }}"
           NEW_KEY="${{ secrets.RS_PUB_KEY }}"
           
           if [ -z "$NEW_DOMAIN" ] || [ -z "$NEW_KEY" ]; then
-            echo "Error: RENDEZVOUS_DOMAIN or RS_PUB_KEY secret is missing!"
+            echo "Error: Secrets missing!"
             exit 1
           fi
 
-          # 替换配置（无论是否冲突，确保最终使用机密值）
+          # 仅当上游修改了目标变量时才替换
           sed -i -E "s|(pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[)[^]]*(\];)|\1\"$NEW_DOMAIN\"\2|g" src/config.rs
           sed -i -E "s|(pub const RS_PUB_KEY: &str = )\".*?\"(;)|\1\"$NEW_KEY\"\2|g" src/config.rs
 
-      - name: Debug - Show modified lines
+      - name: Debug - Show modified lines (if variables updated)
+        if: env.VARIABLES_UPDATED == 'true'
         run: |
           grep -E "RENDEZVOUS_SERVERS|RS_PUB_KEY" src/config.rs
 
-      - name: Commit changes
+      - name: Commit changes (if any)
         run: |
           git add src/config.rs .github/workflows/sync-hbb-common.yml
-          git commit -m "Sync from upstream (preserve local, resolve conflicts with upstream) + update config" || echo "No changes to commit"
+          git commit -m "Sync from upstream (if updated) + update variables (if modified)" || echo "No changes to commit"
           git push origin main
 
       - name: Debug - Show commit status
