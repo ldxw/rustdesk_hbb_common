@@ -1,0 +1,81 @@
+name: Sync hbb_common with conditional overwrite
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # 每天凌晨同步
+  workflow_dispatch:     # 允许手动触发
+
+permissions:
+  contents: write  # 授予推送权限
+
+jobs:
+  sync-and-config:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure Git user
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream and fetch updates
+        run: |
+          git remote add upstream https://github.com/rustdesk/hbb_common.git || true
+          git fetch upstream
+
+      - name: Sync with upstream (preserve local unless conflict)
+        run: |
+          git checkout main
+          
+          # 尝试普通合并，优先保留本地修改
+          if git merge upstream/main; then
+            echo "Merge successful - no conflicts, local changes preserved"
+          else
+            echo "Conflicts detected - resolving with upstream version for conflicting files"
+            # 冲突时，仅对冲突文件使用上游版本覆盖
+            git merge --abort  # 放弃当前合并
+            git merge upstream/main -X theirs  # 冲突文件采用上游版本
+          fi
+
+      - name: Debug - Check config.rs existence
+        run: |
+          echo "Checking src/config.rs..."
+          if [ -f "src/config.rs" ]; then
+            echo "src/config.rs exists"
+          else
+            echo "Error: src/config.rs not found!"
+            exit 1
+          fi
+
+      - name: Replace domain and key from secrets
+        run: |
+          NEW_DOMAIN="${{ secrets.RENDEZVOUS_DOMAIN }}"
+          NEW_KEY="${{ secrets.RS_PUB_KEY }}"
+          
+          if [ -z "$NEW_DOMAIN" ] || [ -z "$NEW_KEY" ]; then
+            echo "Error: RENDEZVOUS_DOMAIN or RS_PUB_KEY secret is missing!"
+            exit 1
+          fi
+
+          # 替换配置（无论是否冲突，确保最终使用机密值）
+          sed -i -E "s|(pub const RENDEZVOUS_SERVERS: &\[&str\] = &\[)[^]]*(\];)|\1\"$NEW_DOMAIN\"\2|g" src/config.rs
+          sed -i -E "s|(pub const RS_PUB_KEY: &str = )\".*?\"(;)|\1\"$NEW_KEY\"\2|g" src/config.rs
+
+      - name: Debug - Show modified lines
+        run: |
+          grep -E "RENDEZVOUS_SERVERS|RS_PUB_KEY" src/config.rs
+
+      - name: Commit changes
+        run: |
+          git add src/config.rs .github/workflows/sync-hbb-common.yml
+          git commit -m "Sync from upstream (preserve local, resolve conflicts with upstream) + update config" || echo "No changes to commit"
+          git push origin main
+
+      - name: Debug - Show commit status
+        run: |
+          git log -1 --pretty=full
